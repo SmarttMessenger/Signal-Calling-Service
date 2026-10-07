@@ -95,9 +95,9 @@ pub(super) fn allocate(
     let allocation_target_send_rate = min(target_send_rate, requested_max_send_rate);
 
     let simulcast_ideal_send_rate_uncapped =
-        simulcast::ideal_send_rate(&simulcast_allocatable_videos, DataRate::MAX);
+        simulcast::ideal_send_rate(&simulcast_allocatable_videos);
     let simulcast_ideal_send_rate =
-        simulcast::ideal_send_rate(&simulcast_allocatable_videos, requested_max_send_rate);
+        min(simulcast_ideal_send_rate_uncapped, requested_max_send_rate);
     let simulcast_requested_base_rate =
         simulcast::requested_base_rate(&simulcast_allocatable_videos, requested_max_send_rate);
 

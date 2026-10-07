@@ -74,15 +74,14 @@ pub fn ideal_video_layer_index(
     }
 }
 
-pub fn ideal_send_rate(videos: &[AllocatableVideo], max_requested_send_rate: DataRate) -> DataRate {
-    let allocatable: DataRate = videos
+pub fn ideal_send_rate(videos: &[AllocatableVideo]) -> DataRate {
+    videos
         .iter()
         .filter_map(|video| {
             let ideal_layer_index = video.ideal_layer_index?;
             Some(video.layers[ideal_layer_index].incoming_rate)
         })
-        .sum();
-    min(allocatable, max_requested_send_rate)
+        .sum()
 }
 
 pub fn base_video_layer_index(video: &AllocatableVideo) -> Option<usize> {

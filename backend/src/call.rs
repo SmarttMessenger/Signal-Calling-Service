@@ -4294,7 +4294,7 @@ mod call_tests {
             let min_target_send_rate = DataRate::from_kbps(min_target_send_rate_kbps);
             let outgoing_queue_drain_rate = DataRate::from_kbps(outgoing_queue_drain_rate_kbps);
             let max_requested_send_rate = DataRate::from_kbps(max_requested_send_rate_kbps);
-            let ideal_send_rate = simulcast::ideal_send_rate(&videos, max_requested_send_rate);
+            let ideal_send_rate = min(simulcast::ideal_send_rate(&videos), max_requested_send_rate);
             let mut allocated: Vec<_> = simulcast::allocate_send_rate(
                 target_send_rate,
                 min_target_send_rate,
