@@ -103,10 +103,12 @@ pub(super) fn allocate(
 
     // Get the ideal send rate for the SVC senders. Unlike the simulcast ideal send rate,
     // the SVC ideal send rate is *uncapped*.
-    let svc::allocator::AllocationResult {
-        allocated_rate: svc_ideal_send_rate,
-        ..
-    } = svc::allocator::calculate_ideal_send_rate(&svc_sender_allocation_info);
+    let svc_ideal_decode_targets =
+        svc::allocator::find_ideal_decode_targets(&svc_sender_allocation_info);
+    let svc_ideal_send_rate = svc::allocator::calculate_ideal_send_rate(
+        &svc_sender_allocation_info,
+        &svc_ideal_decode_targets,
+    );
 
     // Determine the proportional split between SVC and simulcast.
     let ideal_total = svc_ideal_send_rate + simulcast_ideal_send_rate_uncapped;
@@ -119,7 +121,7 @@ pub(super) fn allocate(
     };
 
     let svc_requested_base_rate = min(
-        svc::allocator::calculate_base_rate(&svc_sender_allocation_info),
+        svc::allocator::calculate_base_rate(&svc_sender_allocation_info, &svc_ideal_decode_targets),
         requested_max_send_rate,
     );
 
@@ -165,6 +167,7 @@ pub(super) fn allocate(
         svc_drain_rate,
         svc_ideal_send_rate,
         &svc_sender_allocation_info,
+        &svc_ideal_decode_targets,
     );
 
     // Perform the actual allocation for the simulcast senders against the simulcast share of

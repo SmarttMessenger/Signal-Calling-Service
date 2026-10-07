@@ -90,20 +90,17 @@ fn do_allocation_pass(
     rate_budget_for_existing: DataRate,
     rate_budget_for_different: DataRate,
     sender_allocation_info: &[SenderAllocationInfo<'_>],
+    ideal_decode_targets: &SelectedDecodeTargets,
     max_targets: usize,
     selected_decode_targets: &mut SelectedDecodeTargets,
 ) -> DataRate {
-    let mut allocated_rate = DataRate::ZERO;
+    debug_assert_eq!(sender_allocation_info.len(), ideal_decode_targets.len());
 
-    let ideal_targets: SmallVec<[Option<DecodeTarget>; MAX_EXPECTED_CLIENTS]> =
-        sender_allocation_info
-            .iter()
-            .map(|info| ideal_decode_target(info.requested_height, info.decode_target_info_list))
-            .collect();
+    let mut allocated_rate = DataRate::ZERO;
 
     for decode_target in 0..max_targets {
         for i in 0..sender_allocation_info.len() {
-            let Some(ideal) = ideal_targets[i] else {
+            let Some(ideal) = ideal_decode_targets[i].decode_target else {
                 continue;
             };
             if decode_target > ideal {
@@ -168,6 +165,7 @@ pub fn allocate(
     drain_rate: DataRate,
     ideal_rate: DataRate,
     sender_allocation_info: &[SenderAllocationInfo<'_>],
+    ideal_decode_targets: &SelectedDecodeTargets,
 ) -> AllocationResult {
     let max_targets = sender_allocation_info
         .iter()
@@ -215,6 +213,7 @@ pub fn allocate(
         rate_budget_for_existing,
         rate_budget_for_different,
         sender_allocation_info,
+        ideal_decode_targets,
         max_targets,
         &mut selected_decode_targets,
     );
@@ -225,38 +224,57 @@ pub fn allocate(
     }
 }
 
-/// Calculates the ideal send rate. The senders in the `sender_allocation_info` array
-/// are expected to be sorted in the order of preference.
+/// Builds a set of [`SelectedDecodeTargets`] in which each decode target is the ideal
+/// decode target for that particular sender.
+pub fn find_ideal_decode_targets(
+    target_infos: &[SenderAllocationInfo<'_>],
+) -> SelectedDecodeTargets {
+    target_infos
+        .iter()
+        .map(|info| SelectedDecodeTarget {
+            demux_id: info.demux_id,
+            decode_target: ideal_decode_target(info.requested_height, info.decode_target_info_list),
+        })
+        .collect()
+}
+
+/// Calculates the ideal send rate.
 pub fn calculate_ideal_send_rate(
-    sender_allocation_info: &[SenderAllocationInfo<'_>],
-) -> AllocationResult {
-    // The ideal send rate is basically an uncapped send rate -- allocate as though we
-    // have unlimited bandwidth at our disposal.
-    allocate(
-        DataRate::MAX,
-        DataRate::MAX,
-        1.0,
-        DataRate::ZERO,
-        DataRate::MAX,
-        sender_allocation_info,
-    )
+    target_infos: &[SenderAllocationInfo<'_>],
+    ideal_decode_targets: &SelectedDecodeTargets,
+) -> DataRate {
+    debug_assert_eq!(target_infos.len(), ideal_decode_targets.len());
+
+    target_infos
+        .iter()
+        .zip(ideal_decode_targets)
+        .filter_map(|(info, ideal_target)| {
+            ideal_target
+                .decode_target
+                .map(|target| info.decode_target_info_list[target].rate)
+        })
+        .sum()
 }
 
 /// Calculates the base rate. The senders in the `sender_allocation_info` array
 /// are expected to be sorted in the order of preference.
-pub fn calculate_base_rate(target_infos: &[SenderAllocationInfo<'_>]) -> DataRate {
+pub fn calculate_base_rate(
+    target_infos: &[SenderAllocationInfo<'_>],
+    ideal_decode_targets: &SelectedDecodeTargets,
+) -> DataRate {
+    debug_assert_eq!(target_infos.len(), ideal_decode_targets.len());
+
     target_infos
         .iter()
-        .filter(|target_info| {
-            // A sender the receiver wants nothing from contributes no base rate.
-            ideal_decode_target(
-                target_info.requested_height,
-                target_info.decode_target_info_list,
-            )
-            .is_some()
+        .zip(ideal_decode_targets)
+        .filter_map(|(info, ideal_target)| {
+            ideal_target.decode_target.map(|_| {
+                info.decode_target_info_list
+                    .first()
+                    .map(|decode_target_info| decode_target_info.rate)
+            })
         })
-        .filter_map(|target_info| target_info.decode_target_info_list.first())
-        .map(|info| info.rate)
+        .map(|info| info.unwrap_or_default())
         .sum()
 }
 
@@ -302,7 +320,16 @@ mod tests {
     // Single-budget allocation with no drain and no ideal cap, for tests that exercise
     // core allocation logic without hysteresis.
     fn alloc(budget: DataRate, infos: &[SenderAllocationInfo<'_>]) -> AllocationResult {
-        allocate(budget, budget, 1.0, DataRate::ZERO, DataRate::MAX, infos)
+        let ideal_targets = find_ideal_decode_targets(infos);
+        allocate(
+            budget,
+            budget,
+            1.0,
+            DataRate::ZERO,
+            DataRate::MAX,
+            infos,
+            &ideal_targets,
+        )
     }
 
     fn selected_targets(pairs: &[(u32, Option<usize>)]) -> SelectedDecodeTargets {
@@ -455,13 +482,11 @@ mod tests {
         let list = target_list(&[(100, 180), (300, 360), (900, 720)]);
         let infos = [info(16, &list, Some(360), None)];
 
-        let result = calculate_ideal_send_rate(&infos);
+        let ideal_targets = find_ideal_decode_targets(&infos);
+        let result = calculate_ideal_send_rate(&infos, &ideal_targets);
 
-        assert_eq!(result.allocated_rate, DataRate::from_kbps(300));
-        assert_eq!(
-            result.selected_decode_targets,
-            selected_targets(&[(16, Some(1))])
-        );
+        assert_eq!(result, DataRate::from_kbps(300));
+        assert_eq!(ideal_targets, selected_targets(&[(16, Some(1))]));
     }
 
     #[test]
@@ -568,16 +593,19 @@ mod tests {
         // A 600 kbps target exceeds the different-budget ceiling but fits the existing one.
         // When it matches active_decode_target it is kept; otherwise it would not be selected.
         let list = target_list(&[(600, 360)]);
+        let infos = [SenderAllocationInfo {
+            active_decode_target: Some(0),
+            ..info(16, &list, None, None)
+        }];
+        let ideal_targets = find_ideal_decode_targets(&infos);
         let result = allocate(
             DataRate::from_kbps(900),
             DataRate::from_kbps(500),
             1.0,
             DataRate::ZERO,
             DataRate::MAX,
-            &[SenderAllocationInfo {
-                active_decode_target: Some(0),
-                ..info(16, &list, None, None)
-            }],
+            &infos,
+            &ideal_targets,
         );
         assert_eq!(result.allocated_rate, DataRate::from_kbps(600));
         assert_eq!(
@@ -592,13 +620,16 @@ mod tests {
         // treated as a candidate switch. The strict different-budget ceiling (500 kbps) rejects
         // the 600 kbps target even though the raw rate_budget would allow it.
         let list = target_list(&[(600, 360)]);
+        let infos = [info(16, &list, None, None)];
+        let ideal_targets = find_ideal_decode_targets(&infos);
         let result = allocate(
             DataRate::from_kbps(900),
             DataRate::from_kbps(500),
             1.0,
             DataRate::ZERO,
             DataRate::MAX,
-            &[info(16, &list, None, None)],
+            &infos,
+            &ideal_targets,
         );
         assert_eq!(result.allocated_rate, DataRate::ZERO);
         assert_eq!(
@@ -618,32 +649,38 @@ mod tests {
         let list_b = target_list(&[(300, 360)]);
         let info_a = info(16, &list_a, None, None);
 
+        let infos_keeps = [
+            info_a,
+            SenderAllocationInfo {
+                active_decode_target: Some(0),
+                ..info(32, &list_b, None, None)
+            },
+        ];
+        let ideal_targets_keeps = find_ideal_decode_targets(&infos_keeps);
         let result_keeps = allocate(
             DataRate::from_kbps(800),
             DataRate::from_kbps(600),
             1.0,
             DataRate::ZERO,
             DataRate::MAX,
-            &[
-                info_a,
-                SenderAllocationInfo {
-                    active_decode_target: Some(0),
-                    ..info(32, &list_b, None, None)
-                },
-            ],
+            &infos_keeps,
+            &ideal_targets_keeps,
         );
         assert_eq!(
             result_keeps.selected_decode_targets[1].decode_target,
             Some(0)
         );
 
+        let infos_rejects = [info_a, info(32, &list_b, None, None)];
+        let ideal_targets_rejects = find_ideal_decode_targets(&infos_rejects);
         let result_rejects = allocate(
             DataRate::from_kbps(800),
             DataRate::from_kbps(600),
             1.0,
             DataRate::ZERO,
             DataRate::MAX,
-            &[info_a, info(32, &list_b, None, None)],
+            &infos_rejects,
+            &ideal_targets_rejects,
         );
         assert_eq!(
             result_rejects.selected_decode_targets[1].decode_target,
@@ -661,16 +698,19 @@ mod tests {
         // falls back to the 180p base tier.
         let list = target_list(&[(200, 180), (600, 360)]);
 
+        let infos_existing = [SenderAllocationInfo {
+            active_decode_target: Some(1),
+            ..info(16, &list, Some(360), None)
+        }];
+        let ideal_targets_existing = find_ideal_decode_targets(&infos_existing);
         let result_existing = allocate(
             DataRate::from_kbps(900),
             DataRate::from_kbps(500),
             1.0,
             DataRate::ZERO,
             DataRate::MAX,
-            &[SenderAllocationInfo {
-                active_decode_target: Some(1),
-                ..info(16, &list, Some(360), None)
-            }],
+            &infos_existing,
+            &ideal_targets_existing,
         );
         assert_eq!(result_existing.allocated_rate, DataRate::from_kbps(600));
         assert_eq!(
@@ -678,13 +718,16 @@ mod tests {
             selected_targets(&[(16, Some(1))])
         );
 
+        let infos_different = [info(16, &list, Some(360), None)];
+        let ideal_targets_different = find_ideal_decode_targets(&infos_different);
         let result_different = allocate(
             DataRate::from_kbps(900),
             DataRate::from_kbps(500),
             1.0,
             DataRate::ZERO,
             DataRate::MAX,
-            &[info(16, &list, Some(360), None)],
+            &infos_different,
+            &ideal_targets_different,
         );
         assert_eq!(result_different.allocated_rate, DataRate::from_kbps(200));
         assert_eq!(
@@ -701,13 +744,16 @@ mod tests {
         // of the raw rate_budget (1000 kbps). The 400 kbps ideal tier is unreachable; the
         // 200 kbps tier is selected as the best affordable alternative.
         let list = target_list(&[(200, 180), (400, 360)]);
+        let infos = [info(16, &list, Some(360), None)];
+        let ideal_targets = find_ideal_decode_targets(&infos);
         let result = allocate(
             DataRate::from_kbps(1000),
             DataRate::from_kbps(1000),
             1.0,
             DataRate::ZERO,
             DataRate::from_kbps(300),
-            &[info(16, &list, Some(360), None)],
+            &infos,
+            &ideal_targets,
         );
         assert_eq!(result.allocated_rate, DataRate::from_kbps(200));
         assert_eq!(
@@ -723,26 +769,32 @@ mod tests {
         // A 500 kbps target passes the existing-budget check but not the different one.
         let list = target_list(&[(500, 360)]);
 
+        let infos_existing = [SenderAllocationInfo {
+            active_decode_target: Some(0),
+            ..info(16, &list, None, None)
+        }];
+        let ideal_targets_existing = find_ideal_decode_targets(&infos_existing);
         let result_existing = allocate(
             DataRate::from_kbps(1000),
             DataRate::from_kbps(400),
             0.9,
             DataRate::from_kbps(300),
             DataRate::MAX,
-            &[SenderAllocationInfo {
-                active_decode_target: Some(0),
-                ..info(16, &list, None, None)
-            }],
+            &infos_existing,
+            &ideal_targets_existing,
         );
         assert_eq!(result_existing.allocated_rate, DataRate::from_kbps(500));
 
+        let infos_different = [info(16, &list, None, None)];
+        let ideal_targets_different = find_ideal_decode_targets(&infos_different);
         let result_different = allocate(
             DataRate::from_kbps(1000),
             DataRate::from_kbps(400),
             0.9,
             DataRate::from_kbps(300),
             DataRate::MAX,
-            &[info(16, &list, None, None)],
+            &infos_different,
+            &ideal_targets_different,
         );
         assert_eq!(result_different.allocated_rate, DataRate::ZERO);
     }
@@ -803,13 +855,11 @@ mod tests {
         let list = target_list(&[(100, 180), (5_000_000, 1080)]);
         let infos = [info(16, &list, Some(1080), None)];
 
-        let result = calculate_ideal_send_rate(&infos);
+        let ideal_targets = find_ideal_decode_targets(&infos);
+        let result = calculate_ideal_send_rate(&infos, &ideal_targets);
 
-        assert_eq!(result.allocated_rate, DataRate::from_kbps(5_000_000));
-        assert_eq!(
-            result.selected_decode_targets,
-            selected_targets(&[(16, Some(1))])
-        );
+        assert_eq!(result, DataRate::from_kbps(5_000_000));
+        assert_eq!(ideal_targets, selected_targets(&[(16, Some(1))]));
     }
 
     #[test]
@@ -823,7 +873,8 @@ mod tests {
             info(48, &list_c, None, None),
         ];
 
-        let base_rate = calculate_base_rate(&infos);
+        let ideal_targets = find_ideal_decode_targets(&infos);
+        let base_rate = calculate_base_rate(&infos, &ideal_targets);
 
         assert_eq!(base_rate, DataRate::from_kbps(150));
     }
@@ -839,7 +890,8 @@ mod tests {
             info(32, &list_b, Some(0), None),
         ];
 
-        assert_eq!(calculate_base_rate(&infos), DataRate::ZERO);
+        let ideal_targets = find_ideal_decode_targets(&infos);
+        assert_eq!(calculate_base_rate(&infos, &ideal_targets), DataRate::ZERO);
         assert_eq!(
             alloc(DataRate::from_kbps(10_000), &infos).allocated_rate,
             DataRate::ZERO
@@ -856,7 +908,8 @@ mod tests {
             info(32, &list_b, Some(0), None),
         ];
 
-        let base_rate = calculate_base_rate(&infos);
+        let ideal_targets = find_ideal_decode_targets(&infos);
+        let base_rate = calculate_base_rate(&infos, &ideal_targets);
 
         assert_eq!(base_rate, DataRate::from_kbps(100));
     }
@@ -868,7 +921,9 @@ mod tests {
         // first().rate = 0, silently contributing nothing. The base rate is underestimated
         // relative to what is actually being forwarded (360p at 500 kbps).
         let list = target_list(&[(0, 180), (500, 360)]);
-        let base_rate = calculate_base_rate(&[info(16, &list, None, None)]);
+        let infos = [info(16, &list, None, None)];
+        let ideal_targets = find_ideal_decode_targets(&infos);
+        let base_rate = calculate_base_rate(&infos, &ideal_targets);
         assert_eq!(base_rate, DataRate::ZERO);
     }
 }
