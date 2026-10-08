@@ -3,13 +3,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::{
-    cmp::{max, min},
-    collections::HashMap,
-};
+use std::cmp::{max, min};
 
 use calling_common::{DataRate, DemuxId, Instant, VideoHeight};
 use log::trace;
+use rustc_hash::FxHashMap;
 
 use crate::call::TARGET_RATE_MINIMUM_ALLOCATION_RATIO;
 
@@ -114,7 +112,7 @@ pub fn allocate_send_rate(
     ideal_send_rate: DataRate,
     outgoing_queue_drain_rate: DataRate,
     videos: &Vec<AllocatableVideo>,
-) -> HashMap<DemuxId, AllocatedVideo> {
+) -> FxHashMap<DemuxId, AllocatedVideo> {
     // We leave some target send rate unallocated to allow the queue to drain.
     // But if the ideal rate is lower than the target rate, there is room
     // between the ideal rate and the target rate to drain the queue.
@@ -144,7 +142,7 @@ pub fn allocate_send_rate(
     let allocatable_rate_for_existing_layers =
         min(allocatable_rate_for_existing_layers, ideal_send_rate);
 
-    let mut allocated_by_sender_demux_id: HashMap<DemuxId, AllocatedVideo> = HashMap::new();
+    let mut allocated_by_sender_demux_id: FxHashMap<DemuxId, AllocatedVideo> = FxHashMap::default();
     let mut allocated_rate = DataRate::ZERO;
 
     // We try to get the lowest layers for each one before trying to get the higher layer for any one.

@@ -8,7 +8,6 @@ mod frame_tracker;
 mod simple_bitset;
 
 use std::{
-    collections::HashMap,
     fmt::Debug,
     ops::{Deref, DerefMut},
     sync::LazyLock,
@@ -19,6 +18,7 @@ use calling_common::{
 };
 use log::{error, info, trace, warn};
 use metrics::event;
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -116,7 +116,7 @@ pub struct ScalableVideoState {
 }
 
 #[derive(Default)]
-struct Receivers(HashMap<DemuxId, ScalableVideoReceiver>);
+struct Receivers(FxHashMap<DemuxId, ScalableVideoReceiver>);
 
 /// Represents a scalable video receiver.
 struct ScalableVideoReceiver {

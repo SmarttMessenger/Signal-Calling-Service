@@ -26,6 +26,7 @@ use nonzero_ext::nonzero;
 use parking_lot::Mutex;
 use prost::Message;
 use reqwest::Url;
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 use strum::IntoEnumIterator;
 use strum_macros::{EnumIter, EnumString};
@@ -841,7 +842,7 @@ struct CallInner {
     /// A list of clients with the status of their raised hand
     raised_hands: Option<Vec<RaisedHand>>,
     /// The latest sequence number of each client in the raised_hands list
-    raised_hands_seqnums: HashMap<DemuxId, u32>,
+    raised_hands_seqnums: FxHashMap<DemuxId, u32>,
 
     /// The last time a status update was sent to the clients
     stats_update_sent: Instant,
@@ -928,7 +929,7 @@ impl CallInner {
             active_speaker_update_sent: now,
 
             raised_hands: None,
-            raised_hands_seqnums: HashMap::new(),
+            raised_hands_seqnums: FxHashMap::default(),
 
             stats_update_sent: now, // easier than using None :)
             removed_clients_update_sent: now - REMOVED_CLIENTS_UPDATE_INTERVAL, // easier than using None :)
@@ -2798,7 +2799,7 @@ impl From<mrp::MrpHeader> for protos::MrpHeader {
 }
 
 #[derive(Default)]
-struct Clients(HashMap<DemuxId, Client>);
+struct Clients(FxHashMap<DemuxId, Client>);
 
 impl Clients {
     fn new() -> Self {
@@ -2923,7 +2924,7 @@ struct Client {
 
     // Updated by incoming video requests
     video_request_proto: Option<protos::device_to_sfu::VideoRequestMessage>,
-    requested_height_by_demux_id: HashMap<DemuxId, VideoHeight>,
+    requested_height_by_demux_id: FxHashMap<DemuxId, VideoHeight>,
     active_speaker_height: VideoHeight,
 
     // Updated by Call::set_target_send_rate
@@ -2957,10 +2958,10 @@ struct Client {
     // Note: The following is n^2 memory usage
     // (where n is the number of clients in the group call).
     // So we need to be careful what we store here.
-    audio_forwarder_by_sender_demux_id: HashMap<DemuxId, SingleSsrcRtpForwarder>,
-    video_forwarder_by_sender_demux_id: HashMap<DemuxId, Vp8SimulcastRtpForwarder>,
-    data_forwarder_by_sender_demux_id: HashMap<DemuxId, SingleSsrcRtpForwarder>,
-    allocated_height_by_sender_demux_id: HashMap<DemuxId, VideoHeight>,
+    audio_forwarder_by_sender_demux_id: FxHashMap<DemuxId, SingleSsrcRtpForwarder>,
+    video_forwarder_by_sender_demux_id: FxHashMap<DemuxId, Vp8SimulcastRtpForwarder>,
+    data_forwarder_by_sender_demux_id: FxHashMap<DemuxId, SingleSsrcRtpForwarder>,
+    allocated_height_by_sender_demux_id: FxHashMap<DemuxId, VideoHeight>,
 
     // Used for reliable RTP transmissions point-to-point
     mrp_stream: mrp::MrpStream<protos::SfuToDevice, protos::DeviceToSfu>,
@@ -3017,7 +3018,7 @@ impl Client {
             is_maybe_in_dtx: false,
 
             video_request_proto: None,
-            requested_height_by_demux_id: HashMap::new(),
+            requested_height_by_demux_id: FxHashMap::default(),
             active_speaker_height: VideoHeight::from(0),
 
             target_send_rate: initial_target_send_rate,
@@ -3036,10 +3037,10 @@ impl Client {
 
             padding_ssrc: None,
 
-            audio_forwarder_by_sender_demux_id: HashMap::new(),
-            video_forwarder_by_sender_demux_id: HashMap::new(),
-            data_forwarder_by_sender_demux_id: HashMap::new(),
-            allocated_height_by_sender_demux_id: HashMap::new(),
+            audio_forwarder_by_sender_demux_id: FxHashMap::default(),
+            video_forwarder_by_sender_demux_id: FxHashMap::default(),
+            data_forwarder_by_sender_demux_id: FxHashMap::default(),
+            allocated_height_by_sender_demux_id: FxHashMap::default(),
 
             // must keep reliable stream state
             mrp_stream: pending_client_info.mrp_stream,

@@ -19,6 +19,9 @@ metrics = { path = "../metrics" }
 # For small, inline collections
 smallvec = "1.15.1"
 
+# For faster hashing of small, non-adversarial keys (demux ids, ssrcs)
+rustc-hash = "2.1.3"
+
 # For error handling
 anyhow = "1.0.104"
 thiserror = "2.0.17"

@@ -932,6 +932,7 @@ dependencies = [
  "rand_distr",
  "reqwest 0.12.28",
  "rlimit",
+ "rustc-hash",
  "rustls",
  "serde",
  "serde_json",
