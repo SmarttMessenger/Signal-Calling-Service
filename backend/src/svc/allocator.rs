@@ -143,16 +143,7 @@ fn do_allocation_pass(
         }
     }
 
-    // Calculate the allocated rate total
-    selected_decode_targets
-        .iter()
-        .enumerate()
-        .filter_map(|(i, selected)| {
-            selected.decode_target.map(|decode_target| {
-                sender_allocation_info[i].decode_target_info_list[decode_target].rate
-            })
-        })
-        .sum()
+    allocated_rate
 }
 
 /// Performs bandwidth allocation. The allocations are guaranteed to fit within
