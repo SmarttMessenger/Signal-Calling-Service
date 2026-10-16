@@ -475,9 +475,7 @@ impl RtcpReportSender {
         self.received_report_stats.last_receiver_report_time
     }
 
-    /// Remember SenderInfo to use for later SenderReports. Receivers echo timestamps back
-    /// as LSR, which is how we match their report blocks to our reports; without it LSR is zero
-    /// and the report block is unusable.
+    /// Remember SenderInfo to use for later SenderReports.
     ///
     /// `preserves_rtp_timestamps` must be false for streams whose timestamps we rewrite aka
     /// simulcast video.
@@ -526,38 +524,19 @@ impl RtcpReportSender {
     }
 
     pub(super) fn remember_report_block(&mut self, report_block: ReportBlock, now: Instant) {
-        // We ignore this report block since we can't determine it's the latest report
-        // This means we in some cases the SFU will not generate stats until the second round of RTCP reports
-        if self.sent_report_stats.last_sender_info.is_some()
-            && (report_block.delay_last_sender_report == 0 || report_block.last_sender_report == 0)
-        {
-            debug!("Ignoring report block due to last sender info");
-            return;
-        }
-        // Ignore reports for old SenderReports. In pathological cases, we may always ignore reports
-        // if we always receive them too late. Remembering the last few sender reports would reduce
-        // this issue, but shouldn't be an issue given reporting rates
-        if report_block.last_sender_report
-            != get_lsr(
-                self.sent_report_stats
-                    .last_sender_info
-                    .as_ref()
-                    .map_or(0, |info| info.ntp_ts),
-            )
-        {
-            debug!("Ignoring report block due to low LSR");
-            return;
-        }
-
-        // When our reporting interval is longer than the clients RR interval, the SFU will receive
-        // multiple RR's with the same LSR referencing the same SR. These RR's may arrive out of
-        // order - we prioritize the newest RR. We differentiate age of RR's based on their DLSR
-        if self
+        // RR's may arrive out of order - we prioritize the newest RR, based on highest
+        // seqnum reported.
+        if let Some(last_block) = self
             .received_report_stats
             .last_receiver_report_block
             .as_ref()
-            .is_some_and(|rb| rb.delay_last_sender_report > report_block.delay_last_sender_report)
+            && report_block.highest_sequence_num < last_block.highest_sequence_num
+            && !maybe_receive_stream_restart(
+                report_block.highest_sequence_num,
+                last_block.highest_sequence_num,
+            )
         {
+            debug!("Ignoring report block due to old highest seqnum");
             return;
         }
 
@@ -599,14 +578,24 @@ impl RtcpReportSender {
     }
 
     fn remember_stats_for_rtt(&mut self, report_block: &ReportBlock, now: Instant) {
-        if self.sent_report_stats.last_sender_info.is_none() {
+        // DLSR is zero until the receiver has received one of our SenderReports
+        if self.sent_report_stats.last_sender_info.is_none()
+            || report_block.delay_last_sender_report == 0
+        {
             return;
         }
 
+        // if the delay is too large, we assume they have not seen our newest sender report
         let delay = dlsr_to_duration(report_block.delay_last_sender_report);
-        let new_rtt_estimate = now
-            .saturating_duration_since(self.sent_report_stats.last_sender_report_time)
-            .saturating_sub(delay);
+        let since_last_sender_report =
+            now.saturating_duration_since(self.sent_report_stats.last_sender_report_time);
+        if delay > since_last_sender_report {
+            debug!(
+                "remember_stats_for_rtt: Ignoring report block since it refers to an older sender report"
+            );
+            return;
+        }
+        let new_rtt_estimate = since_last_sender_report.saturating_sub(delay);
 
         self.update_rtt_estimate(
             new_rtt_estimate,
@@ -907,13 +896,13 @@ impl RtcpReportSender {
         now: Instant,
         buffer: &mut dyn Writable,
     ) {
-        let (ntp_ts, rtp_ts) = self
+        // Always write an NTP timestamp of 0 to disable A/V sync
+        let ntp_ts = 0;
+        let rtp_ts = self
             .received_report_stats
             .last_sender_info
             .as_ref()
-            .map_or((0, self.send_stats.last_rtp_timestamp), |info| {
-                (info.ntp_ts, info.rtp_ts)
-            });
+            .map_or(self.send_stats.last_rtp_timestamp, |info| info.rtp_ts);
         let packet_count = self.send_stats.cumulative_packets;
         let octet_count = self.send_stats.total_payload_bytes;
         let sender_info = SenderInfo {
@@ -928,14 +917,6 @@ impl RtcpReportSender {
         self.sent_report_stats.last_sender_info = Some(sender_info);
         self.sent_report_stats.last_sender_report_time = now;
         self.send_stats.updated_since_last_report = false;
-        // reset the delay we use to identify old packets
-        if let Some(block) = self
-            .received_report_stats
-            .last_receiver_report_block
-            .as_mut()
-        {
-            block.delay_last_sender_report = 0;
-        }
     }
 
     /// returns the rtt estimate and when the estimate was last updated
@@ -2055,6 +2036,129 @@ mod test {
             report_sender.rtcp_report_payload_type(),
             "Should ignore RTX packets"
         );
+    }
+
+    #[test]
+    fn test_forwarded_sender_info_has_ntp_ts_zero() {
+        let ssrc = 123456;
+        let now = Instant::now();
+        let at = |millis| now + Duration::from_millis(millis);
+        let sent_rtp_ts = 960;
+        let forwarded = SenderReport {
+            header: RtcpHeader {
+                has_padding: false,
+                count_or_format: 0,
+                payload_type: RTCP_TYPE_SENDER_REPORT,
+                length_in_words: 6,
+            },
+            sender_info: SenderInfo {
+                ssrc,
+                ntp_ts: 0x1234_5678_9ABC_DEF0,
+                rtp_ts: 10000000,
+                packet_count: 2,
+                octet_count: 100,
+            },
+            report_blocks: vec![],
+        };
+        let write_sender_info = |preserves_rtp_timestamps| {
+            let mut report_sender = RtcpReportSender::new(now);
+            report_sender.remember_sent(
+                &Packet::with_empty_tag(
+                    OPUS_PAYLOAD_TYPE,
+                    1,
+                    sent_rtp_ts,
+                    ssrc,
+                    None,
+                    None,
+                    &[1u8; 5],
+                ),
+                at(10),
+            );
+            report_sender.remember_forwarded_sender_info(
+                &forwarded,
+                preserves_rtp_timestamps,
+                at(20),
+            );
+            let mut buffer = vec![];
+            report_sender.write_report_block_in_place(ssrc, at(30), &mut buffer);
+            SenderInfo::from_bytes(&buffer)
+        };
+
+        let sender_info = write_sender_info(true);
+        assert_eq!(
+            (0, forwarded.sender_info.rtp_ts),
+            (sender_info.ntp_ts, sender_info.rtp_ts),
+            "NTP timestamp is zero when RTP timestamps are preserved"
+        );
+
+        let sender_info = write_sender_info(false);
+        assert_eq!(
+            (0, sent_rtp_ts),
+            (sender_info.ntp_ts, sender_info.rtp_ts),
+            "NTP timestamp is zero when RTP timestamps are not preserved"
+        );
+    }
+
+    #[test]
+    fn test_remember_report_blocks_filtering() {
+        let ssrc = 123456;
+        let now = Instant::now();
+        let at = |millis| now + Duration::from_millis(millis);
+        // Receivers echo back an LSR of zero since our SenderReports have an NTP timestamp of zero
+        let block = |highest_sequence_num, fraction_loss, dlsr_millis: u32| ReportBlock {
+            ssrc,
+            fraction_loss,
+            cumulative_loss_count: U24::try_from(0u32).unwrap(),
+            highest_sequence_num,
+            jitter: 0,
+            last_sender_report: 0,
+            delay_last_sender_report: dlsr_millis * 65536 / 1000,
+        };
+        let rtt_millis = |report_sender: &RtcpReportSender| -> Option<(f64, Instant)> {
+            report_sender
+                .rtt_estimate()
+                .map(|(rtt, updated)| (rtt.as_secs_f64() * 1000.0, updated))
+        };
+
+        let mut report_sender = RtcpReportSender::new(now);
+        report_sender.remember_sent(
+            &Packet::with_empty_tag(OPUS_PAYLOAD_TYPE, 1, 960, ssrc, None, None, &[1u8; 5]),
+            at(0),
+        );
+
+        // Before the receiver has a SenderReport, the report block is still used for loss
+        report_sender.remember_report_block(block(10, 5, 0), at(500));
+        assert_eq!(5, report_sender.total_loss_frac().0);
+        assert_eq!(None, rtt_millis(&report_sender));
+
+        report_sender.write_report_block_in_place(ssrc, at(1000), &mut vec![]);
+
+        // Receiver held our SenderReport for 40ms, so the RTT is 60ms
+        report_sender.remember_report_block(block(20, 7, 40), at(1100));
+        assert_eq!(7, report_sender.total_loss_frac().0);
+        let (rtt, rtt_last_updated_ts) = rtt_millis(&report_sender).unwrap();
+        assert!((rtt - 60.0).abs() < 1.0, "unexpected rtt {rtt}");
+        assert_eq!(at(1100), rtt_last_updated_ts);
+
+        // A reordered, older report block is ignored
+        report_sender.remember_report_block(block(15, 99, 50), at(1150));
+        assert_eq!(7, report_sender.total_loss_frac().0);
+
+        // A report block about an earlier SenderReport is used for loss but not RTT
+        report_sender.remember_report_block(block(25, 9, 500), at(1200));
+        assert_eq!(9, report_sender.total_loss_frac().0);
+        assert_eq!(rtt_last_updated_ts, rtt_millis(&report_sender).unwrap().1);
+
+        // A report block without DLSR is used for loss but not RTT
+        report_sender.remember_report_block(block(30, 11, 0), at(1300));
+        assert_eq!(11, report_sender.total_loss_frac().0);
+        assert_eq!(rtt_last_updated_ts, rtt_millis(&report_sender).unwrap().1);
+
+        // A large drop in the highest seqnum is a stream restart, not an old report block
+        let frac_loss = 15;
+        report_sender.remember_report_block(block(2000, frac_loss - 1, 0), at(1400));
+        report_sender.remember_report_block(block(10, frac_loss, 0), at(1500));
+        assert_eq!(frac_loss, report_sender.total_loss_frac().0);
     }
 
     #[test]
