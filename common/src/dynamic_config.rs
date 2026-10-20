@@ -159,7 +159,7 @@ where
         match get_result.bytes().await {
             Ok(bytes) => {
                 let data = bytes.as_ref();
-                let config = serde_yaml::from_slice(data).map_err(|err| {
+                let config = serde_saphyr::from_slice(data).map_err(|err| {
                     DynamicConfigError::ConfigParseError {
                         raw_config: String::from_utf8_lossy(data).to_string(),
                         error: anyhow::anyhow!(err),
@@ -467,7 +467,7 @@ mod tests {
                 .open(absolute_path)
                 .await
                 .unwrap();
-            let value = serde_yaml::to_string(&config).unwrap();
+            let value = serde_saphyr::to_string(&config).unwrap();
             f.write_all(value.as_bytes()).await.unwrap();
         }
 
