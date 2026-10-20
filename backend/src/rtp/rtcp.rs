@@ -884,14 +884,13 @@ impl RtcpReportSender {
             return;
         };
 
-        let (total_loss_frac, cumulative_loss_i24) =
-            if let Some(loss_stats) = self.max_receiver_loss_stats.as_ref() {
-                (loss_stats.loss_frac, loss_stats.cumulative_packets_lost)
-            } else {
-                // handles case of a solo client or if no other client's reports
-                // are being received by the SFU
-                (self.upload_loss_frac().0, self.cumulative_packets_lost())
-            };
+        let total_loss_frac = self.max_receiver_loss_stats.as_ref().map_or(
+            // handles case of a solo client or if no other client's reports
+            // are being received by the SFU
+            self.upload_loss_frac().0,
+            |loss_stats| loss_stats.loss_frac,
+        );
+        let cumulative_loss_i24 = self.cumulative_packets_lost();
         self.receive_stats.mark_reported();
 
         let interarrival_jitter: u32 = self.receive_stats.jitter_q4 >> 4;
@@ -1657,15 +1656,12 @@ mod test {
 
         // A client receiving this stream reports loss, so we forward that to the sender instead
         // of our own inbound measurement.
-        receiver_report_sender.update_max_loss_stats(Some(LossStats {
-            loss_frac: 64,
-            cumulative_packets_lost: U24::from(7u16),
-        }));
+        receiver_report_sender.update_max_loss_stats(Some(LossStats { loss_frac: 64 }));
         for seqnum in 1005..=1009 {
             receiver_report_sender.remember_received(seqnum, OPUS_PAYLOAD_TYPE, 0, at(0));
         }
         assert_eq!(
-            Some(expected_bytes(ssrc, 64, 7, 1009)),
+            Some(expected_bytes(ssrc, 64, 0, 1009)),
             receiver_report_sender.write_receiver_report_block(ssrc, at(15))
         );
 

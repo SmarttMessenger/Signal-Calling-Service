@@ -1300,6 +1300,7 @@ impl Sfu {
                         .rtp_endpoint_stats(now)
                         .loss_stats
                         .iter()
+                        .filter(|(ssrc, _)| call::relays_end_to_end_loss(**ssrc))
                         .for_each(|(&ssrc, loss_stats)| {
                             call_losses
                                 .entry(ssrc)

@@ -397,6 +397,11 @@ pub(crate) fn forwarding_preserves_rtp_timestamps(ssrc: rtp::Ssrc) -> bool {
     }
 }
 
+/// Only relay E2E loss for audio ssrcs
+pub(crate) fn relays_end_to_end_loss(ssrc: rtp::Ssrc) -> bool {
+    LayerId::from_ssrc(ssrc) == Some(LayerId::Audio)
+}
+
 /// Maps an incoming SSRC to the outgoing SSRC we forward it on. Audio and data keep their
 /// own SSRC, while the incoming video layers all use the Video0 ssrc for outgoing.
 /// Returns None for anything we do not forward, such as RTX.

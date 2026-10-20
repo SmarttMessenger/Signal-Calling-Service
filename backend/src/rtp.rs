@@ -18,7 +18,7 @@ mod types;
 use std::{collections::HashMap, convert::TryInto, sync::Arc};
 
 use calling_common::{
-    Bits, DemuxId, Duration, Instant, U24, Writer, expand_truncated_counter, read_u16,
+    Bits, DemuxId, Duration, Instant, Writer, expand_truncated_counter, read_u16,
 };
 pub use dependency_descriptor::*;
 use log::*;
@@ -221,7 +221,6 @@ impl Default for SsrcState {
 #[derive(Debug, Clone)]
 pub struct LossStats {
     pub loss_frac: u8,
-    pub cumulative_packets_lost: U24,
 }
 
 #[derive(Debug, Clone)]
@@ -906,7 +905,6 @@ impl Endpoint {
                         loss_frac: state
                             .rtcp_report_sender
                             .received_loss_frac_window_aggregate(),
-                        cumulative_packets_lost: state.rtcp_report_sender.cumulative_packets_lost(),
                     },
                 );
                 acc
