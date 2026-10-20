@@ -51,6 +51,8 @@ pub const RTCP_TYPE_SPECIFIC_FEEDBACK: u8 = 206;
 pub const RTCP_FORMAT_PLI: u8 = 1;
 pub const UPDATE_STATS_INTERVAL: Duration = Duration::from_secs(1);
 pub const UPDATE_STATS_INTERVAL_SECS: f64 = 1.0;
+/// Matches connection.rs RTCP_REPORT_INTERVAL minus a little to account for RTT
+pub const RTCP_REPORT_INTERVAL: Duration = Duration::from_millis(4600);
 
 #[derive(Default, Debug)]
 pub struct ControlPacket<'packet> {
@@ -377,6 +379,13 @@ impl ReceiveStats {
             .unwrap_or(0) as u8
     }
 
+    /// Resets state after sending a report
+    fn mark_reported(&mut self) {
+        // reset state for tracking loss
+        self.last_reported_max_seqnum = self.max_seqnum;
+        self.cumulative_loss_in_last_report = self.cumulative_loss;
+    }
+
     fn lost_num_packets_since_last_rr(&self) -> u32 {
         self.cumulative_loss
             .saturating_sub(self.cumulative_loss_in_last_report)
@@ -423,7 +432,9 @@ struct RtcpReportStats {
     last_sender_report_time: Instant,
     last_receiver_report_time: Instant,
     last_receiver_report_block: Option<ReportBlock>,
-    max_loss_frac_reported_by_receiver: u8,
+    loss_frac_window_aggregate: u8,
+    loss_frac_window_start: Instant,
+    loss_frac_window_start_block: Option<ReportBlock>,
 }
 
 impl RtcpReportStats {
@@ -433,7 +444,9 @@ impl RtcpReportStats {
             last_sender_report_time: now,
             last_receiver_report_time: now,
             last_receiver_report_block: None,
-            max_loss_frac_reported_by_receiver: 0,
+            loss_frac_window_aggregate: 0,
+            loss_frac_window_start: now,
+            loss_frac_window_start_block: None,
         }
     }
 }
@@ -524,6 +537,16 @@ impl RtcpReportSender {
     }
 
     pub(super) fn remember_report_block(&mut self, report_block: ReportBlock, now: Instant) {
+        let restarted = self
+            .received_report_stats
+            .last_receiver_report_block
+            .as_ref()
+            .is_some_and(|last_block| {
+                maybe_receive_stream_restart(
+                    report_block.highest_sequence_num,
+                    last_block.highest_sequence_num,
+                )
+            });
         // RR's may arrive out of order - we prioritize the newest RR, based on highest
         // seqnum reported.
         if let Some(last_block) = self
@@ -531,15 +554,13 @@ impl RtcpReportSender {
             .last_receiver_report_block
             .as_ref()
             && report_block.highest_sequence_num < last_block.highest_sequence_num
-            && !maybe_receive_stream_restart(
-                report_block.highest_sequence_num,
-                last_block.highest_sequence_num,
-            )
+            && !restarted
         {
             debug!("Ignoring report block due to old highest seqnum");
             return;
         }
 
+        self.remember_stats_for_loss(restarted, &report_block, now);
         self.remember_stats_for_rtt(&report_block, now);
         self.received_report_stats.last_receiver_report_time = now;
         self.received_report_stats.last_receiver_report_block = Some(report_block);
@@ -549,17 +570,45 @@ impl RtcpReportSender {
         self.max_receiver_loss_stats = loss_stats;
     }
 
-    /// From the perspective of the receiving client. The total loss is based on the loss fraction
-    /// reported in the latest Receiver Report from Client to SFU in this SsrcState.
-    /// @return the loss frac in 255ths and the time of the last received receiver report
-    pub(super) fn total_loss_frac(&self) -> (u8, Instant) {
-        (
-            self.received_report_stats
-                .last_receiver_report_block
-                .as_ref()
-                .map_or(0, |rb| rb.fraction_loss),
-            self.received_report_stats.last_receiver_report_time,
-        )
+    pub(super) fn received_loss_frac_window_aggregate(&self) -> u8 {
+        self.received_report_stats.loss_frac_window_aggregate
+    }
+
+    fn remember_stats_for_loss(
+        &mut self,
+        restarted: bool,
+        report_block: &ReportBlock,
+        now: Instant,
+    ) {
+        let stats = &mut self.received_report_stats;
+        let window_start_block = match stats.loss_frac_window_start_block.as_ref() {
+            Some(window_start_block) if !restarted => window_start_block,
+            _ => {
+                // The first report block only starts the window
+                stats.loss_frac_window_aggregate = 0;
+                stats.loss_frac_window_start = now;
+                stats.loss_frac_window_start_block = Some(report_block.clone());
+                return;
+            }
+        };
+
+        // only update stats if at least one interval has passed to smooth stat spikes
+        if now.saturating_duration_since(stats.loss_frac_window_start) < RTCP_REPORT_INTERVAL {
+            return;
+        }
+
+        let expected = report_block
+            .highest_sequence_num
+            .saturating_sub(window_start_block.highest_sequence_num);
+        let lost = report_block
+            .cumulative_loss()
+            .saturating_sub(window_start_block.cumulative_loss());
+        stats.loss_frac_window_aggregate = (256 * lost)
+            .checked_div(expected)
+            .unwrap_or(0)
+            .min(u8::MAX as u32) as u8;
+        stats.loss_frac_window_start = now;
+        stats.loss_frac_window_start_block = Some(report_block.clone());
     }
 
     pub(super) fn cumulative_packets_lost(&self) -> U24 {
@@ -843,12 +892,7 @@ impl RtcpReportSender {
                 // are being received by the SFU
                 (self.upload_loss_frac().0, self.cumulative_packets_lost())
             };
-        self.receive_stats.last_reported_max_seqnum = self.receive_stats.max_seqnum;
-        // cumulative_loss_in_last is used to figure out how many packets have been lost since
-        // the last report. We can't update it based off lost_since_last since cumulative_loss
-        // can decrease (given duplicate packets), and lost_since_last wouldn't account for
-        // that.
-        self.receive_stats.cumulative_loss_in_last_report = self.receive_stats.cumulative_loss;
+        self.receive_stats.mark_reported();
 
         let interarrival_jitter: u32 = self.receive_stats.jitter_q4 >> 4;
 
@@ -1085,6 +1129,12 @@ impl ReportBlock {
             last_sender_report: parse_u32(&value[Self::LAST_SENDER_REPORT_RANGE]),
             delay_last_sender_report: parse_u32(&value[Self::DELAY_LAST_SENDER_REPORT_RANGE]),
         })
+    }
+
+    /// Negative cumulative loss counts as no loss
+    fn cumulative_loss(&self) -> u32 {
+        let value = u32::from(self.cumulative_loss_count);
+        if value >= 1 << 23 { 0 } else { value }
     }
 }
 
@@ -1632,6 +1682,89 @@ mod test {
     }
 
     #[test]
+    fn test_reported_loss_is_accumulated_over_window() {
+        let ssrc = 123456;
+        let now = Instant::now();
+        let interval = RTCP_REPORT_INTERVAL;
+        let step = interval / 50;
+        let at = |offset: Duration| now + offset;
+        let block = |highest_sequence_num, cumulative_loss: u32, fraction_loss| ReportBlock {
+            ssrc,
+            fraction_loss,
+            cumulative_loss_count: U24::try_from(cumulative_loss).unwrap(),
+            highest_sequence_num,
+            jitter: 0,
+            last_sender_report: 0,
+            delay_last_sender_report: 0,
+        };
+
+        let mut report_sender = RtcpReportSender::new(now);
+
+        report_sender.remember_report_block(block(1000, 100, 0), at(Duration::from_millis(0)));
+        assert_eq!(
+            0,
+            report_sender.received_loss_frac_window_aggregate(),
+            "Always report 0% if unknown window start time (first block)"
+        );
+
+        // Report cumulative 10% loss but interval loss of 50%
+        for i in 1..50 {
+            report_sender.remember_report_block(block(1000 + 10 * i, 100 + i, 128), at(step * i));
+        }
+        assert_eq!(
+            0,
+            report_sender.received_loss_frac_window_aggregate(),
+            "No loss fracs should be reported without a full interval of data"
+        );
+
+        report_sender.remember_report_block(block(1500, 150, 128), at(interval));
+        assert_eq!(
+            25,
+            report_sender.received_loss_frac_window_aggregate(),
+            "Have one window of data now. Sent 500 packets, lost 50 for 10% loss == 25 in 1/255 units"
+        );
+
+        report_sender.remember_report_block(block(1510, 150, 0), at(interval + step));
+        assert_eq!(
+            25,
+            report_sender.received_loss_frac_window_aggregate(),
+            "Value does not update in the middle of a window (smoothing)"
+        );
+
+        // Older report blocks are ignored
+        report_sender.remember_report_block(block(1400, 500, 255), at(interval + step * 2));
+        // Fast forward to the next RTCP REPORT interval
+        report_sender.remember_report_block(block(1600, 170, 0), at(interval * 2));
+        assert_eq!(
+            51,
+            report_sender.received_loss_frac_window_aggregate(),
+            "New window should be the delta loss. Sent 100 packets, lost 20 for 200% loss == 51 in 1/255 units"
+        );
+
+        report_sender.remember_report_block(block(1700, 0xffffff, 0), at(interval * 3));
+        assert_eq!(
+            0,
+            report_sender.received_loss_frac_window_aggregate(),
+            "Handle invalid value"
+        );
+
+        report_sender.remember_report_block(block(1800, 190, 51), at(interval * 4));
+        report_sender.remember_report_block(block(10, 0, 0), at(interval * 4 + step));
+        assert_eq!(
+            0,
+            report_sender.received_loss_frac_window_aggregate(),
+            "Restarts should reset window values"
+        );
+
+        report_sender.remember_report_block(block(110, 50, 0), at(interval * 5 + step));
+        assert_eq!(
+            128,
+            report_sender.received_loss_frac_window_aggregate(),
+            "Restarts successfully count loss"
+        );
+    }
+
+    #[test]
     fn test_receiver_report_sender_jitter() {
         let mut receiver_report_sender = RtcpReportSender::new(Instant::now());
 
@@ -2114,6 +2247,13 @@ mod test {
             last_sender_report: 0,
             delay_last_sender_report: dlsr_millis * 65536 / 1000,
         };
+        let last_frac = |report_sender: &RtcpReportSender| {
+            report_sender
+                .received_report_stats
+                .last_receiver_report_block
+                .as_ref()
+                .map(|block| block.fraction_loss)
+        };
         let rtt_millis = |report_sender: &RtcpReportSender| -> Option<(f64, Instant)> {
             report_sender
                 .rtt_estimate()
@@ -2128,37 +2268,37 @@ mod test {
 
         // Before the receiver has a SenderReport, the report block is still used for loss
         report_sender.remember_report_block(block(10, 5, 0), at(500));
-        assert_eq!(5, report_sender.total_loss_frac().0);
+        assert_eq!(Some(5), last_frac(&report_sender));
         assert_eq!(None, rtt_millis(&report_sender));
 
         report_sender.write_report_block_in_place(ssrc, at(1000), &mut vec![]);
 
         // Receiver held our SenderReport for 40ms, so the RTT is 60ms
         report_sender.remember_report_block(block(20, 7, 40), at(1100));
-        assert_eq!(7, report_sender.total_loss_frac().0);
+        assert_eq!(Some(7), last_frac(&report_sender));
         let (rtt, rtt_last_updated_ts) = rtt_millis(&report_sender).unwrap();
         assert!((rtt - 60.0).abs() < 1.0, "unexpected rtt {rtt}");
         assert_eq!(at(1100), rtt_last_updated_ts);
 
         // A reordered, older report block is ignored
         report_sender.remember_report_block(block(15, 99, 50), at(1150));
-        assert_eq!(7, report_sender.total_loss_frac().0);
+        assert_eq!(Some(7), last_frac(&report_sender));
 
         // A report block about an earlier SenderReport is used for loss but not RTT
         report_sender.remember_report_block(block(25, 9, 500), at(1200));
-        assert_eq!(9, report_sender.total_loss_frac().0);
+        assert_eq!(Some(9), last_frac(&report_sender));
         assert_eq!(rtt_last_updated_ts, rtt_millis(&report_sender).unwrap().1);
 
         // A report block without DLSR is used for loss but not RTT
         report_sender.remember_report_block(block(30, 11, 0), at(1300));
-        assert_eq!(11, report_sender.total_loss_frac().0);
+        assert_eq!(Some(11), last_frac(&report_sender));
         assert_eq!(rtt_last_updated_ts, rtt_millis(&report_sender).unwrap().1);
 
         // A large drop in the highest seqnum is a stream restart, not an old report block
         let frac_loss = 15;
         report_sender.remember_report_block(block(2000, frac_loss - 1, 0), at(1400));
         report_sender.remember_report_block(block(10, frac_loss, 0), at(1500));
-        assert_eq!(frac_loss, report_sender.total_loss_frac().0);
+        assert_eq!(Some(frac_loss), last_frac(&report_sender));
     }
 
     #[test]

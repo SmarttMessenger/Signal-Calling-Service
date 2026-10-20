@@ -900,11 +900,12 @@ impl Endpoint {
                     return acc;
                 };
 
-                let (loss_frac, _) = state.rtcp_report_sender.total_loss_frac();
                 acc.insert(
                     ssrc,
                     LossStats {
-                        loss_frac,
+                        loss_frac: state
+                            .rtcp_report_sender
+                            .received_loss_frac_window_aggregate(),
                         cumulative_packets_lost: state.rtcp_report_sender.cumulative_packets_lost(),
                     },
                 );
